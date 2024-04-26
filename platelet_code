@@ -1,0 +1,96 @@
+####一、关联分析前VCF的质控####
+#step 1: filter ExcessHet > 54.69
+gatk --java-options "-Xmx20G" VariantFiltration
+-V inputfile.vcf.gz \
+--filter-expression "ExcessHet > 54.69" \
+--filter-name ExcessHet \
+-O output.excesshet.vcf.gz
+#step 2: VQSR,filter no pass variants   
+--truth-sensitivity-filter-level 99.6 #for SNPs
+--truth-sensitivity-filter-level 99.0  #for INDELs
+#step3: split multisite to biallele site
+bcftools norm -m -both -f /reference/hg38.fa input.vcf.gz | bcftools view --threads 5 --min-ac 1 -e 'ALT="*"' -Oz -o output.normed.vcf.gz
+#step4: filter inbreeding coefficient <-0.3 and Long INDEL (length>50bp)
+bcftools filter --threads 5 -e 'INFO/InbreedingCoeff<-0.3' output.normed.vcf.gz | bcftools filter --threads 5 -e 'ILEN>=50 || ILEN<=-50' -O z -o output.normed.ibd.vcf.gz
+#step5: set missing ( GQ<20 or DP<10 )
+bcftools filter output.normed.ibd.vcf.gz -i 'FMT/GQ>=20 || FMT/DP>=10' --threads 10 -Oz -o output.normed.ibd.gqdp.vcf.gz
+#step6: filter missing genotype rate >5% and hwe p value<1e-6
+vcftools --gzvcf output.normed.ibd.gqdp.vcf.gz --max-missing 0.95 --hwe 1e-6 --recode --recode-INFO-all --stdout | bgzip -c > output.norm.qc.vcf.gz
+#最终获得的VCF文件可直接用于关联分析，此步得到33,430,783个变异。
+
+####二、应用FastSparseGRM进行PCA和获得sGRM####
+#Option 1. Run the pipeline step-by-step.
+##step1. Run KING (version >=2.1.6) (可以不用prune SNP,见King tutorial说明)
+king -b /916thal.vcfQC/916thal_qc_4.bed --ibdseg --degree 4 --cpus 20 --prefix GRM
+##step2. Get ancestry divergence estimates
+R CMD BATCH --vanilla '--args --prefix.in /916thal.vcfQC/916thal_qc_4 --file.seg GRM.seg --num_threads 36 --degree 4 --divThresh -0.02209709 --nRandomSNPs 0 --prefix.out step2' /FastSparseGRM/extdata/getDivergence_wrapper.R getDivergence.Rout
+##step3. Extract unrelated samples
+R CMD BATCH --vanilla '--args --prefix.in /916thal.vcfQC/916thal_qc_4 --file.seg GRM.seg --degree 4 --file.div step2.div  --prefix.out step3' /FastSparseGRM/extdata/extractUnrelated_wrapper.R extractUnrelated.Rout
+##pre-step4 and step5
+##选择maf>=0.01的变异并且进行LD prune
+###对maf>=0.01的变异进行--indep-pairwise 50 5 0.2去除连锁
+plink --bfile 916thal_qc_4 --indep-pairwise 50 5 0.2 --out 916thal_qc_5
+###prune.in是修剪后剩下的变异
+less 916thal_qc_6.prune.in  > prunein.txt
+plink --bfile 916thal_qc_5  --extract prunein.txt --make-bed --out 916thal_qc_6
+##step4. Run PCA
+R  CMD BATCH --vanilla '--args --prefix.in 916thal_qc_6 --file.unrels step3.unrels --prefix.out step4 --no_pcs 20 --num_threads 36 --no_iter 10' /FastSparseGRM/extdata/runPCA_wrapper.R runPCA.Rout
+##step5. Calculate Sparse GRM
+R CMD BATCH --vanilla '--args --prefix.in 916thal_qc_6 --prefix.out step5 --file.train step3.unrels --file.score step4.score --file.seg GRM.seg --num_threads 36 --no_pcs 20 --block.size 5000 --max.related.block 5000 --KINGformat.out  TRUE --degree 4' /FastSparseGRM/extdata/calcSparseGRM_wrapper.R calcSparseGRM.Rout
+##最终得到的step4.score和step5.sGRM.RData是所需要的PC1-20和sGRM的数据，注意step5.sGRM.RData的ID需主要要和表型数据的样本ID一致。
+
+
+####三、Fit Null model和残差正态转置####
+library(GENESIS)
+library(Biobase)
+library(SeqVarTools)
+thalphe <- read.csv("thalphecov.csv")
+thalphe$sample.id <- thalphe$geno_id
+phe <- thalphe[,-1]
+# Make AnnotatedDataFrame (specifically required by GENESIS)
+data_GENESIS <- as(phe,"AnnotatedDataFrame")
+#载入GRM数据（见FastSparseGRM教程）
+load("../Desktop/step5.sGRM.RData")
+nullmod <- fitNullModel(data_GENESIS, outcome = "plt", covars = c("age", "sex","hbb","hba","freetrans","transfusiontime","hgb","sf","PC1","PC2","PC3","PC4","PC5","PC6","PC7","PC8","PC9","PC10"), cov.mat = sGRM,two.stage=TRUE,norm.option = "all", rescale = "residSD",AIREML.tol=1e-4,verbose=TRUE)
+
+
+####四、应用GENESIS单变量关联分析####
+library(GENESIS) 
+library(Biobase)
+library(SeqVarTools)
+gds <- seqOpen("thal.gds")
+seqData <- SeqVarData(gds, sampleData=annot)
+iterator <- SeqVarBlockIterator(seqData, verbose=FALSE)
+plt_gwas <- assocTestSingle(iterator, nullmod,
+ test="Score",
+ recalc.pval.thresh=0.05, fast.score.SE=FALSE,
+GxE=NULL, geno.coding="additive",
+sparse=TRUE, imputed=FALSE,
+ male.diploid=TRUE, genome.build="hg38",
+BPPARAM=BiocParallel::SerialParam(), verbose=TRUE)
+
+####五、应用MAGMA进行基于基因的关联分析和基于基因集的富集分析####
+#step1:基因注释
+此步用gwas_qc后的bfile文件中的bim文件进行基因注释。下载的NCBI38.ZIP文件需要解压缩，应用NCBI38.gene.loc进行注释。
+magma --annotate --snp-loc 916thal_magma.bim  --gene-loc /magma/NCBI38.gene.loc --out 916thal_magma_annotation
+#step2: gene-based 关联分析
+magma --bfile /magma/g1000_eas --pval plt_magma.txt N=916 --gene-annot 916thal_magma_annotation.genes.annot --out plt_genebased
+结果文件：生成两个文件：.genes.out和 .genes.raw
+#step3 基因集 通路分析 gene-set analysis、pathway
+这一步是对基因是否显著富集于某个基因集或通路进行检验
+magma --gene-results plt_genebased.genes.raw --set-annot /magma/msigdb_v2023.2.Hs_GMTs/c5.all.v2023.2.Hs.entrez.gmt --out plt
+
+
+####六、STAARpipeline分析流程####
+具体脚本见https://github.com/xihaoli/STAARpipeline-Tutorial教程。
+
+####七、遗传解释度和遗传相关性分析####
+#利用plink二进制文件，生成GRM矩阵（genetic relationship matrix）
+gcta-1.94.1 --bfile /916thal.vcf_qc_data/916thal_qc_4 --make-grm --make-grm-alg 1 --out thal_grm
+#准备性状/表型文件
+后缀为.txt格式，不需要表头，第一列为family ID，第二列为individual ID，第三列和第四列为 phenotypes（分别为plt和mpv数据）。
+#计算遗传相关性和遗传度
+gcta-1.94.1 --reml-bivar 1 2 --pheno pltmpv.txt --grm thal_grm --threads 30 --out plt_mpv_relationship
+#查看结果
+less plt_mpv_relationship.hsq
+rG即为遗传相关性，分别代表两个性状/表型间的遗传相关性（genetic correlation）和标准误（Stand error）；V(G)/Vp_tr1：是plt的遗传力（度）；V(G)/Vp_tr2：是mpv的遗传力（度）。

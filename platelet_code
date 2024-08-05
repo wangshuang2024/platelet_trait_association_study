@@ -82,7 +82,7 @@ magma --gene-results plt_genebased.genes.raw --set-annot /magma/msigdb_v2023.2.H
 
 
 ####六、STAARpipeline分析流程####
-具体脚本见https://github.com/xihaoli/STAARpipeline-Tutorial教程。
+具体脚本见https://github.com/xihaoli/STAARpipeline-Tutorial教程。本文件中列举了以PLT为例的罕见变异分析。
 
 ####七、遗传解释度和遗传相关性分析####
 #利用plink二进制文件，生成GRM矩阵（genetic relationship matrix）
